@@ -5,6 +5,19 @@ on:
     - cron: '0 0 * * 1'   # Monday 00:00 UTC, every week
   workflow_dispatch: {}    # manual trigger from the Actions tab
 
+# BUG FIX: GitHub sets the auto-generated GITHUB_TOKEN to READ-ONLY by
+# default for any repository owned by a personal account, confirmed
+# directly from GitHub's own changelog (this has been the default since
+# February 2023). Without this block, the "Persist static cache" step's
+# `git push` fails with a 403 and the whole job exits with code 128 --
+# this is exactly what "Process completed with exit code 128" means when
+# nothing else in the log points to a different cause. `contents: write`
+# grants just enough access for this workflow to commit and push
+# static_cache.json back to the repo; every other permission stays at its
+# safe default (unset = none), per GitHub's own least-privilege guidance.
+permissions:
+  contents: write
+
 jobs:
   scan:
     runs-on: ubuntu-latest
