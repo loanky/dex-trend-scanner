@@ -530,6 +530,135 @@ def test_gecko_limiter_is_genuinely_shared_across_functions():
     print("test_gecko_limiter_is_genuinely_shared_across_functions (structural check): PASS")
 
 
+def test_ratelimiter_ramp_up_uses_wider_interval_for_first_n_calls():
+    """
+    REGRESSION TEST for a real fix made after a live GitHub Actions run
+    (a real DEBUG-level log from an actual run) showed 8 GeckoTerminal
+    calls landing within 17.5 seconds of process start before a 429 hit,
+    despite the throttle's own 2.5s-per-call spacing never being violated.
+    Root cause: a fresh RateLimiter's _last_call starts at 0.0, so the
+    FIRST call on any new instance is never delayed -- correct for
+    spacing out consecutive calls, but it means every fresh process (which
+    is what every GitHub Actions run is) starts with call density higher
+    than the steady-state average implies, right when a rate-limit window
+    is most likely to be freshly opened.
+
+    This test proves the fix with REAL wall-clock measurement: for the
+    first ramp_up_calls calls on a fresh instance, gaps between calls
+    genuinely use ramp_up_interval_sec, not min_interval_sec.
+    """
+    import time as time_module
+
+    test_limiter = scanner.RateLimiter(
+        min_interval_sec=0.15, ramp_up_calls=3, ramp_up_interval_sec=0.35,
+    )
+
+    timestamps = []
+    start = time_module.monotonic()
+    for _ in range(3):
+        test_limiter.wait()
+        timestamps.append(time_module.monotonic() - start)
+
+    # Call 1 (index 0) is the free first call -- no prior state, ~instant.
+    assert timestamps[0] < 0.1, (
+        f"First call on a fresh limiter should return near-instantly, took {timestamps[0]:.3f}s"
+    )
+    # Gap from call 1 -> call 2 should reflect ramp_up_interval_sec (0.35s),
+    # since call_count was 1 (< ramp_up_calls=3) when call 2's wait() ran.
+    gap_1_to_2 = timestamps[1] - timestamps[0]
+    assert gap_1_to_2 >= 0.35 * 0.95, (
+        f"Gap between call 1 and 2 should reflect the wider ramp-up interval "
+        f"(~0.35s), only got {gap_1_to_2:.3f}s -- ramp-up may not be applying "
+        f"to early calls correctly"
+    )
+    # Gap from call 2 -> call 3 should ALSO reflect ramp_up_interval_sec,
+    # since call_count was 2 (still < ramp_up_calls=3) when call 3's wait() ran.
+    gap_2_to_3 = timestamps[2] - timestamps[1]
+    assert gap_2_to_3 >= 0.35 * 0.95, (
+        f"Gap between call 2 and 3 should ALSO reflect the wider ramp-up "
+        f"interval (~0.35s), only got {gap_2_to_3:.3f}s"
+    )
+    print(f"test_ratelimiter_ramp_up_uses_wider_interval_for_first_n_calls: PASS "
+          f"(gaps: {gap_1_to_2:.3f}s, {gap_2_to_3:.3f}s, both >= ramp_up_interval_sec)")
+
+
+def test_ratelimiter_reverts_to_normal_interval_after_ramp_up_ends():
+    """
+    Companion to the test above: proves the interval genuinely narrows
+    back down to min_interval_sec once ramp_up_calls have completed --
+    ramp-up is meant to be a temporary widening for the highest-risk early
+    calls, not a permanent slowdown of the whole run.
+    """
+    import time as time_module
+
+    test_limiter = scanner.RateLimiter(
+        min_interval_sec=0.15, ramp_up_calls=2, ramp_up_interval_sec=0.35,
+    )
+
+    timestamps = []
+    start = time_module.monotonic()
+    for _ in range(4):
+        test_limiter.wait()
+        timestamps.append(time_module.monotonic() - start)
+
+    # Calls 1->2 and 2->3: call_count was 1 then 2 when each wait() ran.
+    # ramp_up_calls=2 means only call_count < 2 uses ramp-up -- so the gap
+    # INTO call 2 (call_count=1 at that point) is ramp-up, but the gap INTO
+    # call 3 (call_count=2 at that point, no longer < 2) should already be
+    # back to the normal interval.
+    gap_1_to_2 = timestamps[1] - timestamps[0]
+    gap_2_to_3 = timestamps[2] - timestamps[1]
+    gap_3_to_4 = timestamps[3] - timestamps[2]
+
+    assert gap_1_to_2 >= 0.35 * 0.95, (
+        f"Gap 1->2 should still be ramp-up (~0.35s), got {gap_1_to_2:.3f}s"
+    )
+    assert gap_2_to_3 < 0.35 * 0.95, (
+        f"Gap 2->3 should have REVERTED to the normal interval (~0.15s, "
+        f"well under the 0.35s ramp-up interval), but got {gap_2_to_3:.3f}s -- "
+        f"ramp-up may not be reverting correctly after ramp_up_calls is reached"
+    )
+    assert gap_2_to_3 >= 0.15 * 0.95, (
+        f"Gap 2->3 should be at least the normal interval (~0.15s), got {gap_2_to_3:.3f}s"
+    )
+    assert gap_3_to_4 >= 0.15 * 0.95 and gap_3_to_4 < 0.35 * 0.95, (
+        f"Gap 3->4 should also be the normal interval (~0.15s, not ~0.35s), "
+        f"got {gap_3_to_4:.3f}s"
+    )
+    print(f"test_ratelimiter_reverts_to_normal_interval_after_ramp_up_ends: PASS "
+          f"(gaps: {gap_1_to_2:.3f}s [ramp-up], {gap_2_to_3:.3f}s [reverted], "
+          f"{gap_3_to_4:.3f}s [normal])")
+
+
+def test_production_gecko_limiter_is_actually_configured_with_ramp_up():
+    """
+    Structural check that the REAL, production gecko_limiter instance
+    (not a test-only RateLimiter) is genuinely constructed with ramp-up
+    parameters -- catches the case where the RateLimiter CLASS supports
+    ramp-up correctly (proven by the two tests above) but a future edit
+    accidentally removes the ramp_up_calls/ramp_up_interval_sec arguments
+    from the actual gecko_limiter = RateLimiter(...) instantiation,
+    silently reverting to the pre-fix behavior without any test noticing.
+    """
+    assert scanner.gecko_limiter.ramp_up_calls > 0, (
+        f"scanner.gecko_limiter.ramp_up_calls is {scanner.gecko_limiter.ramp_up_calls} "
+        f"-- expected > 0. The production GeckoTerminal limiter should have "
+        f"ramp-up configured; if this is 0, the fix for the burst-density "
+        f"issue found in a real live run has been silently reverted."
+    )
+    assert scanner.gecko_limiter.ramp_up_interval_sec > scanner.gecko_limiter.min_interval_sec, (
+        f"scanner.gecko_limiter.ramp_up_interval_sec "
+        f"({scanner.gecko_limiter.ramp_up_interval_sec}) should be WIDER than "
+        f"min_interval_sec ({scanner.gecko_limiter.min_interval_sec}) -- a "
+        f"ramp-up interval that's equal to or narrower than the normal "
+        f"interval provides no actual protection."
+    )
+    print(f"test_production_gecko_limiter_is_actually_configured_with_ramp_up: PASS "
+          f"(ramp_up_calls={scanner.gecko_limiter.ramp_up_calls}, "
+          f"ramp_up_interval_sec={scanner.gecko_limiter.ramp_up_interval_sec}, "
+          f"min_interval_sec={scanner.gecko_limiter.min_interval_sec})")
+
+
 def make_email_test_config(**overrides) -> scanner.Config:
     """
     Shared config builder for the four send_match_email failure-mode tests
@@ -688,6 +817,9 @@ if __name__ == "__main__":
     test_dedupe_across_rank_by_metrics()
     test_mint_address_resolved_and_emailed_even_when_check_holders_is_false()
     test_gecko_limiter_is_genuinely_shared_across_functions()
+    test_ratelimiter_ramp_up_uses_wider_interval_for_first_n_calls()
+    test_ratelimiter_reverts_to_normal_interval_after_ramp_up_ends()
+    test_production_gecko_limiter_is_actually_configured_with_ramp_up()
     test_missing_smtp_password_raises_clear_error()
     test_missing_smtp_user_raises_clear_error()
     test_missing_email_from_raises_clear_error()

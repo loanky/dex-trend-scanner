@@ -187,18 +187,64 @@ SOLANA_RPC_MIN_INTERVAL_SEC = 0.5
 
 
 class RateLimiter:
-    """Simple token-bucket-of-one: blocks until min_interval has elapsed since last call."""
+    """
+    Token-bucket-of-one: blocks until min_interval has elapsed since last
+    call. Optionally supports a "ramp-up" period: for the first
+    ramp_up_calls calls of a fresh instance, uses ramp_up_interval_sec
+    instead of min_interval_sec, then reverts to min_interval_sec for
+    every call after that.
 
-    def __init__(self, min_interval_sec: float):
+    WHY RAMP-UP EXISTS (found from a real live run, not a guess): a fresh
+    RateLimiter's _last_call starts at 0.0, so the FIRST call on any new
+    instance is never delayed at all -- elapsed-since-0.0 is always huge,
+    so the "wait if elapsed < min_interval" check never triggers. This is
+    correct for spacing out consecutive calls, but it means a brand-new
+    process (which is what every GitHub Actions run is -- fresh process,
+    fresh RateLimiter, every single time) starts with an unthrottled call,
+    then settles into steady spacing after that.
+
+    This matters because a steady-state average (e.g. "24 calls/min at a
+    2.5s interval, comfortably under a 30/min ceiling") describes an
+    indefinite average -- it does NOT describe the density of calls in the
+    first ~15-20 seconds of a fresh process, which is denser than the
+    average once you remove that free first call. A real DEBUG-level log
+    from an actual live run confirmed this exactly: 8 GeckoTerminal calls
+    landed within 17.5 seconds (computed timestamps matched a 2.5s gap
+    between EVERY pair of calls, confirming the throttle itself was never
+    violated) before the 8th call hit a 429. 8 calls / 17.5s works out to
+    ~27.4 calls/min if that density continued -- uncomfortably close to
+    the documented 30/min ceiling if GeckoTerminal enforces its limit as a
+    rolling or fixed window (common for rate limiting) rather than a pure
+    smooth long-run average.
+
+    Ramp-up directly targets this: widen the interval specifically for the
+    first several calls (the exact window where density is highest),
+    computed to hold ~20-22 calls/min during that period -- real, computed
+    margin under the 30/min ceiling, not just barely under it -- then
+    relax back to the normal steady-state interval once enough calls have
+    happened that a 60s rolling window would naturally include some of the
+    slower early calls too, further diluting density on its own.
+    """
+
+    def __init__(self, min_interval_sec: float, ramp_up_calls: int = 0,
+                 ramp_up_interval_sec: float = 0.0):
         self.min_interval_sec = min_interval_sec
+        self.ramp_up_calls = ramp_up_calls
+        self.ramp_up_interval_sec = ramp_up_interval_sec
         self._last_call = 0.0
+        self._call_count = 0
 
     def wait(self):
+        active_interval = self.min_interval_sec
+        if self._call_count < self.ramp_up_calls:
+            active_interval = self.ramp_up_interval_sec
+
         now = time.monotonic()
         elapsed = now - self._last_call
-        if elapsed < self.min_interval_sec:
-            time.sleep(self.min_interval_sec - elapsed)
+        if elapsed < active_interval:
+            time.sleep(active_interval - elapsed)
         self._last_call = time.monotonic()
+        self._call_count += 1
 
 
 dex_limiter = RateLimiter(DEXSCREENER_MIN_INTERVAL_SEC)
@@ -216,7 +262,17 @@ dex_limiter = RateLimiter(DEXSCREENER_MIN_INTERVAL_SEC)
 # using ONE shared instance for all three call sites, so the 2.5s interval
 # is genuinely a floor between ANY two GeckoTerminal calls, regardless of
 # which function makes them.
-gecko_limiter = RateLimiter(GECKOTERMINAL_MIN_INTERVAL_SEC)
+#
+# RAMP-UP FIX (found from a real live run, see RateLimiter's docstring for
+# the full reasoning): the first 10 calls use a wider 3.0s interval
+# instead of the normal 2.5s -- 10 was chosen to comfortably cover the
+# exact 8-call burst seen in the real log this was diagnosed from, with
+# margin. 3.0s was computed to hold ~22 calls/min during that period, a
+# real ~26% margin under the 30/min ceiling, rather than the thinner
+# margin the steady-state 2.5s interval alone provided during a fresh
+# process's early calls specifically.
+gecko_limiter = RateLimiter(GECKOTERMINAL_MIN_INTERVAL_SEC,
+                             ramp_up_calls=10, ramp_up_interval_sec=3.0)
 coingecko_limiter = RateLimiter(COINGECKO_MIN_INTERVAL_SEC)
 rpc_limiter = RateLimiter(SOLANA_RPC_MIN_INTERVAL_SEC)
 
