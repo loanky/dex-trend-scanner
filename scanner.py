@@ -181,7 +181,11 @@ DEXSCREENER_MIN_INTERVAL_SEC = 0.25     # ~240/min, under the documented 300/min
 # some point, and older/third-party sources hadn't caught up. This constant
 # is shared across THREE call sites: fetch_ranked_pools (discovery),
 # fetch_ohlcv (candle check), and resolve_base_token_address (mint lookup).
-GECKOTERMINAL_MIN_INTERVAL_SEC = 2.5    # ~24/min, 80% of the confirmed 30/min ceiling
+GECKOTERMINAL_MIN_INTERVAL_SEC = 3.333  # ~18/min, 40% margin under the confirmed 30/min ceiling
+                                         # (genuinely 2x the prior 20% margin -- see the note
+                                         # in RateLimiter's docstring below for why simply
+                                         # doubling the interval would NOT have doubled the
+                                         # margin, since margin is nonlinear relative to interval)
 COINGECKO_MIN_INTERVAL_SEC = 0.7        # ~85/min, under the documented 100/min Demo tier cap
 SOLANA_RPC_MIN_INTERVAL_SEC = 0.5
 
@@ -264,15 +268,19 @@ dex_limiter = RateLimiter(DEXSCREENER_MIN_INTERVAL_SEC)
 # which function makes them.
 #
 # RAMP-UP FIX (found from a real live run, see RateLimiter's docstring for
-# the full reasoning): the first 10 calls use a wider 3.0s interval
-# instead of the normal 2.5s -- 10 was chosen to comfortably cover the
-# exact 8-call burst seen in the real log this was diagnosed from, with
-# margin. 3.0s was computed to hold ~22 calls/min during that period, a
-# real ~26% margin under the 30/min ceiling, rather than the thinner
-# margin the steady-state 2.5s interval alone provided during a fresh
-# process's early calls specifically.
+# the full reasoning): the first 10 calls use a wider interval than the
+# steady-state one, since a fresh process's early calls are denser than
+# the long-run average implies. Both this ramp-up interval and the
+# steady-state GECKOTERMINAL_MIN_INTERVAL_SEC above were widened together
+# to genuinely double their respective safety margins under the 30/min
+# ceiling (not just doubled in raw seconds -- margin is nonlinear
+# relative to interval, so naively doubling the interval would have
+# tripled the margin instead of doubling it; see the worked computation
+# in this project's README.md for the exact arithmetic). 6.0s during
+# ramp-up holds ~10 calls/min, a 66.7% margin under 30/min -- genuinely
+# 2x the prior 33.3% margin the original 3.0s ramp-up interval provided.
 gecko_limiter = RateLimiter(GECKOTERMINAL_MIN_INTERVAL_SEC,
-                             ramp_up_calls=10, ramp_up_interval_sec=3.0)
+                             ramp_up_calls=10, ramp_up_interval_sec=6.0)
 coingecko_limiter = RateLimiter(COINGECKO_MIN_INTERVAL_SEC)
 rpc_limiter = RateLimiter(SOLANA_RPC_MIN_INTERVAL_SEC)
 
