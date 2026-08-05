@@ -61,7 +61,7 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MATCH_EMAIL_RECIPIENTS: ${{ secrets.MATCH_EMAIL_RECIPIENTS }}
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-        run: python3 scanner.py --config config.yaml --once --log-level INFO
+        run: python3 scanner.py --config config.yaml --once --log-level DEBUG
 
       # static_cache.json is the only state file left to persist between
       # runs (repeat-match suppression was removed on request, so there is
