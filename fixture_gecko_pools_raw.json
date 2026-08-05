@@ -1,0 +1,103 @@
+{
+  "data": [
+    {
+      "id": "solana_AAAABBBBCCCC1111",
+      "type": "pool",
+      "attributes": {
+        "address": "AAAABBBBCCCC1111",
+        "name": "PASS / SOL",
+        "pool_created_at": "2026-07-10T04:00:00Z",
+        "fdv_usd": "185000.00",
+        "market_cap_usd": "181000.00",
+        "reserve_in_usd": "42000.00",
+        "price_change_percentage": {"h1": "2.1", "h24": "18.2"},
+        "transactions": {
+          "h24": {"buys": 900, "sells": 640, "buyers": 500, "sellers": 400}
+        },
+        "volume_usd": {"h24": "210000.00"}
+      },
+      "relationships": {"dex": {"data": {"id": "pumpswap", "type": "dex"}}}
+    },
+    {
+      "id": "solana_DDDDEEEEFFFF2222",
+      "type": "pool",
+      "attributes": {
+        "address": "DDDDEEEEFFFF2222",
+        "name": "NEWB / SOL",
+        "pool_created_at": "2026-07-30T15:06:40Z",
+        "fdv_usd": "185000.00",
+        "market_cap_usd": "181000.00",
+        "reserve_in_usd": "42000.00",
+        "price_change_percentage": {"h1": "3.0", "h24": "10.0"},
+        "transactions": {
+          "h24": {"buys": 900, "sells": 640, "buyers": 500, "sellers": 400}
+        },
+        "volume_usd": {"h24": "210000.00"}
+      },
+      "relationships": {"dex": {"data": {"id": "pumpswap", "type": "dex"}}}
+    },
+    {
+      "id": "solana_GGGGHHHHIIII3333",
+      "type": "pool",
+      "attributes": {
+        "address": "GGGGHHHHIIII3333",
+        "name": "WRONG / SOL",
+        "pool_created_at": "2026-07-10T04:00:00Z",
+        "fdv_usd": "185000.00",
+        "market_cap_usd": "181000.00",
+        "reserve_in_usd": "42000.00",
+        "price_change_percentage": {"h1": "1.5", "h24": "9.0"},
+        "transactions": {
+          "h24": {"buys": 900, "sells": 640, "buyers": 500, "sellers": 400}
+        },
+        "volume_usd": {"h24": "210000.00"}
+      },
+      "relationships": {"dex": {"data": {"id": "raydium", "type": "dex"}}}
+    },
+    {
+      "id": "solana_JJJJKKKKLLLL4444",
+      "type": "pool",
+      "attributes": {
+        "address": "JJJJKKKKLLLL4444",
+        "name": "LOWLIQ / SOL",
+        "pool_created_at": "2026-07-10T04:00:00Z",
+        "fdv_usd": "185000.00",
+        "market_cap_usd": "181000.00",
+        "reserve_in_usd": "1500.00",
+        "price_change_percentage": {"h1": "0.9", "h24": "12.0"},
+        "transactions": {
+          "h24": {"buys": 900, "sells": 640, "buyers": 500, "sellers": 400}
+        },
+        "volume_usd": {"h24": "210000.00"}
+      },
+      "relationships": {"dex": {"data": {"id": "pumpswap", "type": "dex"}}}
+    },
+    {
+      "id": "solana_MMMMNNNNOOOO5555",
+      "type": "pool",
+      "attributes": {
+        "address": "MMMMNNNNOOOO5555",
+        "name": "NOLIQ / SOL",
+        "pool_created_at": "2026-07-10T04:00:00Z",
+        "fdv_usd": "185000.00",
+        "market_cap_usd": null,
+        "reserve_in_usd": null,
+        "price_change_percentage": {"h1": "0.9", "h24": "12.0"},
+        "transactions": {
+          "h24": {"buys": 900, "sells": 640, "buyers": 500, "sellers": 400}
+        },
+        "volume_usd": {"h24": "210000.00"}
+      },
+      "relationships": {"dex": {"data": {"id": "pumpswap", "type": "dex"}}}
+    },
+    {
+      "id": "solana_PPPPQQQQRRRR6666",
+      "type": "pool",
+      "attributes": {
+        "address": "PPPPQQQQRRRR6666",
+        "name": "MALFORMED",
+        "pool_created_at": "2026-07-10T04:00:00Z"
+      }
+    }
+  ]
+}

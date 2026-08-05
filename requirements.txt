@@ -1,0 +1,7 @@
+# Solana DEX Pool Scanner -- requirements.txt
+# (This file's content is otherwise identical to the separate Perpetual-
+# Futures scanner's requirements.txt -- this header is the only thing that
+# tells them apart if you're looking at just this file with no folder
+# context. See this project's README.md, section 0, for the full setup.)
+requests
+pyyaml

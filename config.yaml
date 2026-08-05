@@ -1,0 +1,126 @@
+# Solana DEX pool scanner config -- ranked, all-token discovery version.
+# Do NOT commit smtp_password or your CoinGecko API key to git directly --
+# both are read from environment variables (see the *_env fields below).
+
+# --- Schedule (documentation only -- see note below for why) ---
+# This value is NOT read by GitHub Actions -- GitHub's own cron trigger
+# must be a literal string baked into the workflow YAML file at
+# .github/workflows/scan.yml, evaluated before any job or script runs.
+# Confirmed directly from GitHub's own community docs: "Dynamic schedule
+# setting is not supported, you cannot dynamically set the value." There
+# is no config file, secret, or variable GitHub Actions will read to
+# decide when to trigger a scheduled workflow -- only a literal cron
+# string in the `on: schedule:` block of the workflow file itself.
+#
+# This field exists so the intended schedule is documented in ONE place a
+# human reads first, and so this value stays meaningful if you ever run
+# this script via `--loop` or a real system crontab instead of GitHub
+# Actions (see README.md's "Configuring the schedule" section) -- both of
+# those DO read config values or accept them directly, unlike GitHub
+# Actions' schedule trigger.
+#
+# TO ACTUALLY CHANGE THE GITHUB ACTIONS SCHEDULE: edit this value here for
+# documentation, AND separately edit the literal cron string in
+# .github/workflows/scan.yml's `- cron:` line to match. Both must be
+# updated by hand; changing only this file does nothing to the real
+# trigger. See README.md for the exact line to edit and a link to
+# crontab.guru for building new cron expressions.
+schedule_cron: "0 0 * * 1"   # Monday 00:00 UTC -- must match scan.yml's cron line exactly
+
+# --- Discovery: GeckoTerminal ranked /pools (primary) ---
+network: "solana"          # GeckoTerminal network slug
+
+# Which metric to rank by. This is a LIST, but entries are swept
+# SEQUENTIALLY, one full metric (all its pages) at a time, then merged and
+# de-duplicated by pool address -- NOT queried simultaneously in one call
+# (GeckoTerminal's API only accepts one `sort` value per request regardless).
+# Adding a second entry genuinely doubles discovery-phase API calls every
+# cycle, since each entry triggers its own full sweep. Defaults to ONE
+# entry so you can freely change which single metric is used without
+# reconfiguring anything else -- add a second entry only if you actually
+# want both swept and merged every cycle, not just to keep options handy.
+#
+# CONFIRMED FREE (directly in GeckoTerminal's own changelog, for the plain
+# /pools?sort= endpoint used here):
+#   h24_volume_usd_desc, h24_tx_count_desc
+# NOT FREE: a four-value sort list including h24_price_percentage_change_desc
+# and pool_created_at_desc exists, but only on CoinGecko's separate
+# Megafilter endpoint (/v3/onchain/pools/megafilter), confirmed
+# Analyst-tier-and-above (paid) directly from CoinGecko's own status page,
+# their own Megafilter tutorial, and independent coverage -- not usable
+# with the free Demo key this scanner is built around. Not wired in here.
+# UNCONFIRMED (inferred by naming convention only, untested against this
+# specific free endpoint -- test with --log-level DEBUG before trusting):
+#   h24_volume_usd_asc, h24_tx_count_asc, market_cap_usd_desc/_asc,
+#   fdv_usd_desc/_asc. See scanner.py's module docstring for the full list.
+rank_by:
+  - "h24_volume_usd_desc"
+
+max_pages_per_rank: 20     # GeckoTerminal returns 20 pools/page -> up to 400
+                            # raw pools per cycle (before core filtering).
+                            # At the corrected GECKOTERMINAL_MIN_INTERVAL_SEC
+                            # (2.5s, see scanner.py), even a generously-high
+                            # 400-candidate-pool worst case computes to under
+                            # 40 minutes total -- comfortably inside the
+                            # 2-hour target with real margin. Raise further
+                            # if you want broader coverage still; the actual
+                            # constraint is GitHub Actions' job timeout
+                            # (.github/workflows/scan.yml), not the API.
+
+dex_ids: []                 # empty = no DEX filter, i.e. genuinely "all Solana
+                             # DEXes" as asked. Set e.g. ["pumpswap", "raydium"]
+                             # to narrow back down if you want that later.
+
+# --- Discovery: DexScreener keyword search (optional secondary) ---
+# Leave empty to rely solely on GeckoTerminal ranked discovery above.
+search_terms: []
+
+# --- Core filters ---
+min_age_weeks: 2.0
+min_fdv: 50000
+max_fdv: 2000000
+min_txns_24h: 200
+min_volume_24h: 20000
+max_volume_24h: 5000000
+min_liquidity_usd: 15000
+
+# --- Holder count (CoinGecko primary, Solana RPC top-20 fallback) ---
+check_holders: true
+holder_count_source: "coingecko"
+coingecko_api_key_env: "COINGECKO_API_KEY"
+min_holders: 5
+max_holders: 5000
+holder_dust_threshold: 1.0                              # only used if holder_count_source: "solana_rpc"
+solana_rpc_url: "https://api.mainnet-beta.solana.com"    # only used if holder_count_source: "solana_rpc"
+
+# --- Green-candle check (GeckoTerminal OHLCV) ---
+check_green_candles: true
+green_candle_timeframe: "day"   # GeckoTerminal vocabulary: "day", "hour", "minute"
+green_candle_count: 3
+
+# --- Email ---
+# Addresses are NOT stored here -- only the NAMES of environment variables
+# that hold them, read at runtime. This keeps every address (sender,
+# recipient, SMTP login) out of git entirely, since this file is meant to
+# be safely committable even in a public repo. Set the actual values as
+# GitHub Actions secrets (see .github/workflows/scan.yml) or local
+# environment variables -- see README.md's setup section.
+smtp_host: "smtp.gmail.com"
+smtp_port: 587
+smtp_user_env: "GMAIL_ADDRESS"          # env var holding the address you authenticate as
+smtp_password_env: "GMAIL_APP_PASSWORD"
+email_from_env: "GMAIL_ADDRESS"         # usually the same env var as smtp_user_env above
+email_to_env: "MATCH_EMAIL_RECIPIENTS"  # comma-separated if sending to more than one address
+
+# --- Operational / caching ---
+# NOTE: repeat-match suppression was removed on request. A pool that
+# matches every filter is emailed EVERY cycle it still matches, including
+# pools that also matched in a previous cycle. There is no "already
+# emailed" tracking anymore -- only static_cache_path below, which is a
+# pure fetch-avoidance optimization and never affects which pools match.
+poll_interval_sec: 604800   # 1 week, in seconds -- ONLY consulted in --loop
+                             # mode (see README.md for why an external weekly
+                             # cron trigger + --once is what's recommended
+                             # instead of --loop for a weekly cadence)
+static_cache_path: "static_cache.json"   # provably-unchanging pool fields only
+max_pairs_per_search: 50    # only relevant if search_terms is non-empty
