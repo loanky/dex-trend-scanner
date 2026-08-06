@@ -659,6 +659,115 @@ def test_production_gecko_limiter_is_actually_configured_with_ramp_up():
           f"min_interval_sec={scanner.gecko_limiter.min_interval_sec})")
 
 
+class _Fake429Response:
+    """Minimal fake response object exposing only .headers, for testing
+    log_429_and_get_backoff() without a real HTTP round-trip."""
+    def __init__(self, headers):
+        self.headers = headers
+
+
+def test_429_backoff_uses_numeric_retry_after_when_present():
+    """
+    Added alongside real GeckoTerminal API calls being modified to log
+    full response headers on a 429 -- this was done specifically to get
+    real evidence (does GeckoTerminal send Retry-After? X-RateLimit-*?
+    nothing at all?) after a live run 429'd despite the script's own
+    throttle respecting a 66.7%-margin gap, rather than continue guessing
+    at constants with no server feedback. This test proves the numeric
+    happy path: when the server DOES send a plain-integer Retry-After,
+    that exact value is used instead of the generic default.
+    """
+    resp = _Fake429Response({"Retry-After": "42", "X-RateLimit-Remaining": "0"})
+    backoff = scanner.log_429_and_get_backoff(resp, "test-context", default_backoff_sec=15)
+    assert backoff == 42, f"Expected the server's Retry-After value (42), got {backoff}"
+    print("test_429_backoff_uses_numeric_retry_after_when_present: PASS")
+
+
+def test_429_backoff_falls_back_on_non_numeric_retry_after():
+    """
+    Retry-After can legally be an HTTP-date string instead of a plain
+    integer (RFC 7231) -- this script doesn't parse dates, so it must
+    fall back to the default rather than crash on int('Wed, 21 Oct...').
+    """
+    resp = _Fake429Response({"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
+    backoff = scanner.log_429_and_get_backoff(resp, "test-context", default_backoff_sec=15)
+    assert backoff == 15, f"Expected fallback to default_backoff_sec (15), got {backoff}"
+    print("test_429_backoff_falls_back_on_non_numeric_retry_after: PASS")
+
+
+def test_429_backoff_falls_back_when_retry_after_absent():
+    """
+    The genuinely diagnostic case: no Retry-After header at all. Per
+    general HTTP rate-limiting references (not GeckoTerminal-specific --
+    no source found confirms their exact convention), a missing
+    Retry-After is more often associated with infrastructure-level
+    blocking than a standard, well-behaved rate limiter. This test proves
+    the function still returns a sane, usable backoff value in that case
+    (the default) rather than None or a crash -- the diagnostic value is
+    in the LOG line this triggers, not in the return value changing.
+    """
+    resp = _Fake429Response({"Content-Type": "application/json"})
+    backoff = scanner.log_429_and_get_backoff(resp, "test-context", default_backoff_sec=15)
+    assert backoff == 15, f"Expected fallback to default_backoff_sec (15), got {backoff}"
+    print("test_429_backoff_falls_back_when_retry_after_absent: PASS")
+
+
+def test_fetch_ranked_pools_actually_sleeps_the_returned_backoff():
+    """
+    Proves fetch_ranked_pools doesn't just CALL log_429_and_get_backoff
+    and ignore its return value (a real, easy mistake -- the old code had
+    a hardcoded time.sleep(15) right next to the log line, and it would
+    be simple to add the new helper call without actually wiring its
+    return value into the sleep). Mocks time.sleep to capture what
+    duration was actually requested, using a fake 429 response with a
+    server-specified Retry-After that's deliberately different from the
+    function's own default_backoff_sec, so a bug that ignores the
+    server's value and sleeps the hardcoded default instead would be
+    caught by this test failing.
+    """
+    sleep_calls = []
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    class FakeResponse:
+        status_code = 429
+        headers = {"Retry-After": "77"}  # deliberately != the 15s default
+
+    class FakeSession:
+        def get(self, *a, **k):
+            return FakeResponse()
+
+    original_sleep = scanner.time.sleep
+    try:
+        scanner.time.sleep = fake_sleep
+        result = scanner.fetch_ranked_pools("solana", "h24_volume_usd_desc", 1, FakeSession())
+    finally:
+        scanner.time.sleep = original_sleep
+
+    assert result is None, f"Expected None on a 429, got {result}"
+    # NOTE: fetch_ranked_pools also calls gecko_limiter.wait() BEFORE making
+    # the request at all -- that's the rate limiter's own legitimate sleep
+    # (ramp-up or steady-state pacing), which also goes through the same
+    # globally-mocked time.sleep(). So sleep_calls may legitimately have
+    # more than one entry; what this test actually verifies is that the
+    # LAST sleep -- the one triggered by the 429 handler specifically --
+    # matches the server's Retry-After value, not the hardcoded default.
+    assert len(sleep_calls) >= 1, f"Expected at least one sleep call, got {sleep_calls}"
+    last_sleep = sleep_calls[-1]
+    assert last_sleep == 77, (
+        f"Expected the 429 handler's sleep (the LAST call, after any prior "
+        f"rate-limiter pacing sleep) to be 77s (the server's Retry-After "
+        f"value), but it was {last_sleep}s -- full sleep sequence: "
+        f"{sleep_calls}. This means fetch_ranked_pools is either ignoring "
+        f"the helper's return value or using the hardcoded default instead "
+        f"of what the server actually said."
+    )
+    print("test_fetch_ranked_pools_actually_sleeps_the_returned_backoff: PASS "
+          f"(full sleep sequence: {sleep_calls}, 429 backoff correctly used "
+          f"the server's 77s Retry-After value as the last sleep)")
+
+
 def make_email_test_config(**overrides) -> scanner.Config:
     """
     Shared config builder for the four send_match_email failure-mode tests
@@ -820,6 +929,10 @@ if __name__ == "__main__":
     test_ratelimiter_ramp_up_uses_wider_interval_for_first_n_calls()
     test_ratelimiter_reverts_to_normal_interval_after_ramp_up_ends()
     test_production_gecko_limiter_is_actually_configured_with_ramp_up()
+    test_429_backoff_uses_numeric_retry_after_when_present()
+    test_429_backoff_falls_back_on_non_numeric_retry_after()
+    test_429_backoff_falls_back_when_retry_after_absent()
+    test_fetch_ranked_pools_actually_sleeps_the_returned_backoff()
     test_missing_smtp_password_raises_clear_error()
     test_missing_smtp_user_raises_clear_error()
     test_missing_email_from_raises_clear_error()

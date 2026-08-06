@@ -352,6 +352,60 @@ def load_config(path: str) -> Config:
     return Config(**raw)
 
 
+def log_429_and_get_backoff(resp: requests.Response, context: str, default_backoff_sec: int) -> int:
+    """
+    Logs the FULL response headers on a 429, and returns how many seconds
+    to actually sleep before retrying.
+
+    WHY THIS EXISTS: after a real GitHub Actions run hit a 429 despite the
+    script's own throttle respecting a 6.0s gap between every call (66.7%
+    margin under GeckoTerminal's documented 30/min ceiling), it became
+    unclear whether this was (a) GeckoTerminal enforcing a stricter real
+    limit than documented, (b) a shared-IP/datacenter-traffic effect on
+    GitHub Actions' runner pool, or (c) something else entirely -- and
+    continuing to guess and re-tune constants without evidence wasn't
+    productive. This function surfaces the actual server response instead.
+
+    No source consulted (official GeckoTerminal docs, or general HTTP
+    rate-limiting references) confirms GeckoTerminal's exact header
+    convention -- unlike GitHub's API, which documents X-RateLimit-* by
+    name, nothing found here says GeckoTerminal does the same. Rather than
+    guess a specific header name and silently miss the real one, this
+    logs the COMPLETE header dict, so whatever GeckoTerminal actually
+    sends is visible in the log regardless of naming convention.
+
+    One genuinely useful diagnostic, from general HTTP rate-limiting
+    references (not GeckoTerminal-specific, but a widely-cited pattern):
+    a 429 that does NOT include a Retry-After header is more often
+    associated with bot-detection/infrastructure-level blocking than with
+    a standard, well-behaved rate limiter, which "almost always" sets it.
+    This function logs explicitly whether Retry-After was present, as a
+    direct signal toward that question -- not proof either way on its
+    own, but real evidence rather than another guess.
+    """
+    headers_dict = dict(resp.headers)
+    log.warning("%s 429 -- full response headers: %s", context, headers_dict)
+
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after:
+        log.warning("%s: server sent Retry-After=%r", context, retry_after)
+        if retry_after.isdigit():
+            return int(retry_after)
+        log.warning("%s: Retry-After value isn't a plain integer (could be an "
+                     "HTTP-date instead, which this script doesn't parse) -- "
+                     "falling back to the default %ds backoff", context, default_backoff_sec)
+    else:
+        log.warning("%s: NO Retry-After header present. Per general HTTP "
+                     "rate-limiting convention, well-behaved rate limiters "
+                     "almost always include this -- its absence is a real, "
+                     "though not conclusive, signal worth weighing toward "
+                     "infrastructure-level blocking rather than a standard "
+                     "limiter. Falling back to the default %ds backoff.",
+                     context, default_backoff_sec)
+
+    return default_backoff_sec
+
+
 # --------------------------------------------------------------------------
 # GeckoTerminal ranked discovery (primary): /networks/{network}/pools?sort=
 # --------------------------------------------------------------------------
@@ -421,8 +475,10 @@ def fetch_ranked_pools(network: str, rank_by: str, page: int,
         timeout=15,
     )
     if resp.status_code == 429:
-        log.warning("GeckoTerminal /pools 429 rate limited; backing off 15s")
-        time.sleep(15)
+        backoff = log_429_and_get_backoff(
+            resp, f"GeckoTerminal /pools (sort={rank_by!r}, page={page})", default_backoff_sec=15,
+        )
+        time.sleep(backoff)
         return None
     if resp.status_code == 400:
         log.error(
@@ -624,8 +680,10 @@ def fetch_ohlcv(pool_address: str, network: str, timeframe: str,
     resp = session.get(url, params={"limit": limit}, timeout=15,
                         headers={"Accept": "application/json;version=20230302"})
     if resp.status_code == 429:
-        log.warning("GeckoTerminal 429 on pool=%s; backing off 15s", pool_address)
-        time.sleep(15)
+        backoff = log_429_and_get_backoff(
+            resp, f"GeckoTerminal /ohlcv (pool={pool_address})", default_backoff_sec=15,
+        )
+        time.sleep(backoff)
         return None
     if resp.status_code == 404:
         # Pool not indexed by GeckoTerminal yet -- common for very new pools
@@ -832,9 +890,13 @@ def resolve_base_token_address(pool_address: str, network: str,
         # Was silently returning None with no log or backoff -- inconsistent
         # with every other rate-limit handler in this file (fetch_ranked_pools,
         # fetch_ohlcv, dexscreener_search, get_coingecko_holder_count all log
-        # and back off 10-15s on a 429). Fixed to match.
-        log.warning("GeckoTerminal per-pool endpoint 429 on pool=%s; backing off 15s", pool_address)
-        time.sleep(15)
+        # and back off 10-15s on a 429). Fixed to match, and now also logs
+        # full headers via log_429_and_get_backoff -- see that function's
+        # docstring for why.
+        backoff = log_429_and_get_backoff(
+            resp, f"GeckoTerminal per-pool endpoint (pool={pool_address})", default_backoff_sec=15,
+        )
+        time.sleep(backoff)
         return None
     if resp.status_code == 404:
         return None
