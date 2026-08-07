@@ -352,10 +352,22 @@ def load_config(path: str) -> Config:
     return Config(**raw)
 
 
+# Tracks every 429 seen during the current run_once() call, for cross-429
+# pattern analysis -- see get_429_pattern_summary() and
+# log_429_pattern_summary(). Reset at the start of every run_once() call
+# (each GitHub Actions run is a fresh process anyway, so this would start
+# empty regardless, but run_once() resets it explicitly rather than rely
+# on that, in case this script is ever run via --loop on a long-lived
+# process, where module-level state WOULD otherwise persist across cycles).
+_429_observations: list[dict] = []
+
+
 def log_429_and_get_backoff(resp: requests.Response, context: str, default_backoff_sec: int) -> int:
     """
     Logs the FULL response headers on a 429, and returns how many seconds
-    to actually sleep before retrying.
+    to actually sleep before retrying. Also records this observation into
+    the module-level _429_observations list, for cross-429 pattern
+    analysis within a single run -- see get_429_pattern_summary().
 
     WHY THIS EXISTS: after a real GitHub Actions run hit a 429 despite the
     script's own throttle respecting a 6.0s gap between every call (66.7%
@@ -365,6 +377,20 @@ def log_429_and_get_backoff(resp: requests.Response, context: str, default_backo
     GitHub Actions' runner pool, or (c) something else entirely -- and
     continuing to guess and re-tune constants without evidence wasn't
     productive. This function surfaces the actual server response instead.
+
+    RESULT FROM A REAL RUN (confirmed evidence, not a guess): a live 429
+    from api.geckoterminal.com came back with Retry-After: 0 -- meaning
+    "you may retry immediately" -- and NO X-RateLimit-* or any
+    GeckoTerminal-specific headers of any kind; every header present was
+    either generic HTTP plumbing or explicitly Cloudflare infrastructure
+    (Server: cloudflare, CF-RAY). Retry-After: 0 is the signature of a
+    genuine, counting rate limiter whose window had just reset -- NOT
+    typical of a bot-detection/infrastructure-level block, which would
+    more likely return a bare rejection with no rate-limit metadata at
+    all. This is real evidence AGAINST the shared-IP-saturation theory
+    being the explanation for that specific 429, though it doesn't rule
+    it out entirely (a genuinely fast-clearing burst of unrelated traffic
+    could theoretically still produce this same signature).
 
     No source consulted (official GeckoTerminal docs, or general HTTP
     rate-limiting references) confirms GeckoTerminal's exact header
@@ -386,14 +412,19 @@ def log_429_and_get_backoff(resp: requests.Response, context: str, default_backo
     headers_dict = dict(resp.headers)
     log.warning("%s 429 -- full response headers: %s", context, headers_dict)
 
-    retry_after = resp.headers.get("Retry-After")
-    if retry_after:
-        log.warning("%s: server sent Retry-After=%r", context, retry_after)
-        if retry_after.isdigit():
-            return int(retry_after)
-        log.warning("%s: Retry-After value isn't a plain integer (could be an "
-                     "HTTP-date instead, which this script doesn't parse) -- "
-                     "falling back to the default %ds backoff", context, default_backoff_sec)
+    retry_after_raw = resp.headers.get("Retry-After")
+    parsed_retry_after: Optional[int] = None
+    backoff = default_backoff_sec
+
+    if retry_after_raw:
+        log.warning("%s: server sent Retry-After=%r", context, retry_after_raw)
+        if retry_after_raw.isdigit():
+            parsed_retry_after = int(retry_after_raw)
+            backoff = parsed_retry_after
+        else:
+            log.warning("%s: Retry-After value isn't a plain integer (could be an "
+                         "HTTP-date instead, which this script doesn't parse) -- "
+                         "falling back to the default %ds backoff", context, default_backoff_sec)
     else:
         log.warning("%s: NO Retry-After header present. Per general HTTP "
                      "rate-limiting convention, well-behaved rate limiters "
@@ -403,7 +434,77 @@ def log_429_and_get_backoff(resp: requests.Response, context: str, default_backo
                      "limiter. Falling back to the default %ds backoff.",
                      context, default_backoff_sec)
 
-    return default_backoff_sec
+    _429_observations.append({
+        "context": context,
+        "retry_after_raw": retry_after_raw,
+        "retry_after_parsed": parsed_retry_after,
+        "had_ratelimit_header": any("ratelimit" in k.lower() for k in headers_dict),
+        "backoff_used": backoff,
+        "timestamp": time.monotonic(),
+    })
+
+    return backoff
+
+
+def log_429_pattern_summary() -> None:
+    """
+    Logs a summary of every 429 observed so far this run, once discovery
+    finishes -- called from run_once() after the discovery loop, not
+    after each individual 429, since the point is seeing the PATTERN
+    across all of them together, not repeating per-429 detail that
+    log_429_and_get_backoff() already logged individually.
+
+    WHAT THIS IS FOR: a single 429 with Retry-After: 0 is one data point.
+    If Retry-After stays consistently near-zero across MULTIPLE 429s in
+    the same run, that's much stronger evidence for a fast-resetting,
+    burst-window rate limiter specifically (the window opens, fills
+    briefly, and clears again quickly) -- a materially different
+    situation from a limiter with a longer rolling window, and different
+    again from a shared-IP effect, which would more plausibly show
+    inconsistent or non-zero Retry-After values as other unrelated
+    traffic's state bleeds in unpredictably. A no-429-this-run outcome is
+    itself informative too, logged explicitly rather than silently saying
+    nothing.
+    """
+    if not _429_observations:
+        # Uses .warning(), matching every other message in this feature
+        # (found during testing: this was originally .info(), the only
+        # mismatched level here -- under some logging configurations, that
+        # would make this specific message silently invisible while every
+        # other 429-pattern message stayed visible, an inconsistency worth
+        # fixing rather than leaving fragile).
+        log.warning("No 429s observed this run.")
+        return
+
+    count = len(_429_observations)
+    retry_after_values = [
+        obs["retry_after_parsed"] for obs in _429_observations
+        if obs["retry_after_parsed"] is not None
+    ]
+    any_ratelimit_header = any(obs["had_ratelimit_header"] for obs in _429_observations)
+
+    log.warning("429 PATTERN SUMMARY for this run: %d total 429(s) observed", count)
+
+    if retry_after_values:
+        all_near_zero = all(v <= 1 for v in retry_after_values)
+        log.warning(
+            "429 PATTERN SUMMARY: Retry-After values seen (parsed, in order): %s -- "
+            "%s",
+            retry_after_values,
+            "ALL near-zero (<=1s) -- consistent with a fast-resetting, "
+            "burst-window rate limiter" if all_near_zero else
+            "NOT all near-zero -- mixed or larger values, worth reading "
+            "individually rather than assuming a single simple pattern",
+        )
+    else:
+        log.warning("429 PATTERN SUMMARY: no numeric Retry-After value was ever "
+                     "parsed from any of the %d observed 429(s) -- see individual "
+                     "warnings above for what each one actually returned.", count)
+
+    log.warning(
+        "429 PATTERN SUMMARY: any X-RateLimit-*-style header ever present across "
+        "all %d observation(s)? %s", count, any_ratelimit_header,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1031,6 +1132,12 @@ def run_once(cfg: Config) -> None:
     now_utc = dt.datetime.now(dt.timezone.utc)
     static_cache = load_static_cache(cfg.static_cache_path)
 
+    # Reset 429 pattern tracking for this run -- see log_429_pattern_summary().
+    # Explicit reset rather than relying on a fresh process each time, in
+    # case this script is ever run via --loop on a long-lived process,
+    # where the module-level list would otherwise persist across cycles.
+    _429_observations.clear()
+
     # --- Discovery: GeckoTerminal ranked /pools, swept across every
     # configured rank_by metric and page. Every pool discovered this way
     # gets its MUTABLE fields fresh from this response -- no caching here,
@@ -1216,6 +1323,13 @@ def run_once(cfg: Config) -> None:
 
     if matches:
         send_match_email(cfg, matches)
+
+    # Logged here, at the true end of the run, so it captures 429s from
+    # BOTH discovery (fetch_ranked_pools) AND the later per-candidate-pool
+    # checks (fetch_ohlcv, resolve_base_token_address) -- not just
+    # discovery alone, since all three functions share the same
+    # log_429_and_get_backoff() helper and feed the same tracking list.
+    log_429_pattern_summary()
 
     save_static_cache(cfg.static_cache_path, static_cache)
 

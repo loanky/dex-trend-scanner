@@ -768,6 +768,172 @@ def test_fetch_ranked_pools_actually_sleeps_the_returned_backoff():
           f"the server's 77s Retry-After value as the last sleep)")
 
 
+class _FakeHeaderResponse:
+    """Minimal fake exposing only .headers, for testing the 429
+    pattern-tracking functions without a real HTTP round-trip."""
+    def __init__(self, headers):
+        self.headers = headers
+
+
+def test_429_pattern_summary_flags_consistent_near_zero_pattern():
+    """
+    Added after a real live 429 came back with Retry-After: 0 -- a single
+    occurrence is one data point; if it recurs consistently across
+    multiple 429s in the same run, that's meaningfully stronger evidence
+    for a fast-resetting burst-window limiter specifically. This proves
+    the summary correctly identifies that pattern when it genuinely
+    occurs, using real (not mocked) calls into log_429_and_get_backoff
+    followed by the real log_429_pattern_summary.
+    """
+    scanner._429_observations.clear()
+    scanner.log_429_and_get_backoff(_FakeHeaderResponse({"Retry-After": "0"}), "call-A", 15)
+    scanner.log_429_and_get_backoff(_FakeHeaderResponse({"Retry-After": "1"}), "call-B", 15)
+    scanner.log_429_and_get_backoff(_FakeHeaderResponse({"Retry-After": "0"}), "call-C", 15)
+
+    assert len(scanner._429_observations) == 3, (
+        f"Expected 3 tracked observations, got {len(scanner._429_observations)}"
+    )
+    values = [obs["retry_after_parsed"] for obs in scanner._429_observations]
+    assert values == [0, 1, 0], f"Expected [0, 1, 0] in order, got {values}"
+
+    # log_429_pattern_summary logs rather than returns a value -- capture
+    # its log output to verify the actual pattern classification.
+    import logging
+    captured = []
+
+    class CapturingHandler(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = CapturingHandler()
+    scanner.log.addHandler(handler)
+    try:
+        scanner.log_429_pattern_summary()
+    finally:
+        scanner.log.removeHandler(handler)
+
+    joined = " ".join(captured)
+    assert "ALL near-zero" in joined, f"Expected the near-zero-pattern message, got: {captured}"
+    print("test_429_pattern_summary_flags_consistent_near_zero_pattern: PASS")
+
+
+def test_429_pattern_summary_flags_mixed_pattern():
+    """Companion test: when Retry-After values are NOT all near-zero,
+    the summary should say so rather than falsely claim a clean pattern."""
+    scanner._429_observations.clear()
+    scanner.log_429_and_get_backoff(_FakeHeaderResponse({"Retry-After": "0"}), "call-A", 15)
+    scanner.log_429_and_get_backoff(_FakeHeaderResponse({"Retry-After": "60"}), "call-B", 15)
+
+    import logging
+    captured = []
+
+    class CapturingHandler(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = CapturingHandler()
+    scanner.log.addHandler(handler)
+    try:
+        scanner.log_429_pattern_summary()
+    finally:
+        scanner.log.removeHandler(handler)
+
+    joined = " ".join(captured)
+    assert "NOT all near-zero" in joined, f"Expected the mixed-pattern message, got: {captured}"
+    assert "ALL near-zero" not in joined, (
+        f"Should NOT claim a clean near-zero pattern when values are mixed, got: {captured}"
+    )
+    print("test_429_pattern_summary_flags_mixed_pattern: PASS")
+
+
+def test_429_pattern_summary_handles_zero_429s_without_crashing():
+    """The no-429s-this-run case must log something informative, not
+    crash on an empty list or silently say nothing."""
+    scanner._429_observations.clear()
+
+    import logging
+    captured = []
+
+    class CapturingHandler(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = CapturingHandler()
+    scanner.log.addHandler(handler)
+    try:
+        scanner.log_429_pattern_summary()  # must not raise
+    finally:
+        scanner.log.removeHandler(handler)
+
+    assert any("No 429s observed" in msg for msg in captured), (
+        f"Expected an explicit 'no 429s' message, got: {captured}"
+    )
+    print("test_429_pattern_summary_handles_zero_429s_without_crashing: PASS")
+
+
+def test_429_tracking_genuinely_resets_between_separate_run_once_calls():
+    """
+    REGRESSION TEST for the actual production wiring, not just the
+    .clear() method in isolation: proves run_once() itself resets
+    _429_observations at its start, by calling the REAL run_once twice in
+    a row (with every network call mocked), injecting a fake 429 during
+    the FIRST call, and confirming the SECOND call's tracking list does
+    NOT still contain the first call's observation. Without the reset
+    line in run_once, a long-lived --loop process (or, more relevantly,
+    any accidental double-invocation) would silently accumulate 429
+    observations across cycles forever, making the pattern summary
+    increasingly misleading over time.
+    """
+    import test_filters as tf
+
+    raw = tf.load_raw_fixture()
+    pass_entry = next(p for p in raw if p["id"] == "solana_AAAABBBBCCCC1111")
+
+    cfg = tf.make_test_config(
+        check_holders=False, check_green_candles=False,
+        static_cache_path="/tmp/test_429_reset_cache.json",
+    )
+
+    call_number = {"n": 0}
+
+    def fake_fetch_ranked_pools_with_one_429_on_first_run(network, rank_by, page, session):
+        call_number["n"] += 1
+        if call_number["n"] == 1 and page == 1:
+            # Inject a fake 429 into the FIRST run_once call specifically,
+            # by calling the real 429 tracker directly (simulating what
+            # fetch_ranked_pools itself would do internally on a real 429).
+            scanner.log_429_and_get_backoff(
+                _FakeHeaderResponse({"Retry-After": "0"}), "injected-for-test", 15,
+            )
+            return []  # then behave as if discovery found nothing, to keep this simple
+        return []
+
+    original_fetch = scanner.fetch_ranked_pools
+    original_send = scanner.send_match_email
+    try:
+        scanner.fetch_ranked_pools = fake_fetch_ranked_pools_with_one_429_on_first_run
+        scanner.send_match_email = lambda cfg_arg, matches: None
+
+        scanner.run_once(cfg)
+        assert len(scanner._429_observations) == 1, (
+            f"Expected exactly 1 tracked 429 after the first run_once call, "
+            f"got {len(scanner._429_observations)}"
+        )
+
+        scanner.run_once(cfg)
+        assert len(scanner._429_observations) == 0, (
+            f"Expected 0 tracked 429s after a SECOND run_once call with no new "
+            f"429 injected -- if this is not 0, run_once() is not resetting "
+            f"_429_observations at its start, and observations are silently "
+            f"accumulating across separate runs, got {len(scanner._429_observations)}"
+        )
+    finally:
+        scanner.fetch_ranked_pools = original_fetch
+        scanner.send_match_email = original_send
+
+    print("test_429_tracking_genuinely_resets_between_separate_run_once_calls: PASS")
+
+
 def make_email_test_config(**overrides) -> scanner.Config:
     """
     Shared config builder for the four send_match_email failure-mode tests
@@ -933,6 +1099,10 @@ if __name__ == "__main__":
     test_429_backoff_falls_back_on_non_numeric_retry_after()
     test_429_backoff_falls_back_when_retry_after_absent()
     test_fetch_ranked_pools_actually_sleeps_the_returned_backoff()
+    test_429_pattern_summary_flags_consistent_near_zero_pattern()
+    test_429_pattern_summary_flags_mixed_pattern()
+    test_429_pattern_summary_handles_zero_429s_without_crashing()
+    test_429_tracking_genuinely_resets_between_separate_run_once_calls()
     test_missing_smtp_password_raises_clear_error()
     test_missing_smtp_user_raises_clear_error()
     test_missing_email_from_raises_clear_error()
