@@ -817,6 +817,71 @@ def test_429_pattern_summary_flags_consistent_near_zero_pattern():
     print("test_429_pattern_summary_flags_consistent_near_zero_pattern: PASS")
 
 
+def test_429_observation_records_the_correct_gecko_call_count():
+    """
+    REGRESSION TEST added after three separate real GitHub Actions runs,
+    on different days, ALL hit their first 429 on exactly gecko_limiter
+    call #8 -- landing on the same call number three times independently
+    is a real, specific signal worth being able to track going forward,
+    not just note by hand from raw log timestamps each time. This proves
+    the tracking mechanism itself is correct: it saves and restores the
+    REAL module-level gecko_limiter's state (rather than substituting a
+    fresh test-only limiter), since log_429_and_get_backoff reads
+    scanner.gecko_limiter specifically via getattr, and mirrors the exact
+    real-world sequence seen in production -- N successful calls, each
+    incrementing the limiter's own _call_count via .wait(), followed by a
+    429 on the next call -- then confirms the recorded gecko_call_count
+    exactly matches the call number that actually 429'd.
+    """
+    original_call_count = scanner.gecko_limiter._call_count
+    original_last_call = scanner.gecko_limiter._last_call
+    original_ramp_up_calls = scanner.gecko_limiter.ramp_up_calls
+    original_ramp_up_interval = scanner.gecko_limiter.ramp_up_interval_sec
+    original_min_interval = scanner.gecko_limiter.min_interval_sec
+
+    try:
+        # Reset to a genuinely fresh state (mirroring a brand-new process),
+        # and use tiny intervals so this test runs fast rather than waiting
+        # on the real production 3.333s/6.0s values.
+        scanner.gecko_limiter._call_count = 0
+        scanner.gecko_limiter._last_call = 0.0
+        scanner.gecko_limiter.ramp_up_calls = 10
+        scanner.gecko_limiter.ramp_up_interval_sec = 0.01
+        scanner.gecko_limiter.min_interval_sec = 0.01
+
+        scanner._429_observations.clear()
+
+        # Simulate 7 successful calls -- exactly the real production
+        # sequence (7 successful pages before the 8th 429s).
+        for _ in range(7):
+            scanner.gecko_limiter.wait()
+
+        # The 8th call: wait() fires first (as it genuinely does in
+        # fetch_ranked_pools, fetch_ohlcv, and resolve_base_token_address),
+        # THEN the 429 is detected and logged -- same real ordering.
+        scanner.gecko_limiter.wait()
+        scanner.log_429_and_get_backoff(
+            _FakeHeaderResponse({"Retry-After": "0"}), "test-call-8", 15,
+        )
+
+        recorded = scanner._429_observations[-1]["gecko_call_count"]
+        assert recorded == 8, (
+            f"Expected the recorded gecko_call_count to be 8 (matching the real "
+            f"production pattern seen across three separate live runs), got {recorded}"
+        )
+        print(f"test_429_observation_records_the_correct_gecko_call_count: PASS "
+              f"(correctly recorded call #{recorded})")
+    finally:
+        # Restore the real gecko_limiter's state so no other test is
+        # affected by this test having run.
+        scanner.gecko_limiter._call_count = original_call_count
+        scanner.gecko_limiter._last_call = original_last_call
+        scanner.gecko_limiter.ramp_up_calls = original_ramp_up_calls
+        scanner.gecko_limiter.ramp_up_interval_sec = original_ramp_up_interval
+        scanner.gecko_limiter.min_interval_sec = original_min_interval
+        scanner._429_observations.clear()
+
+
 def test_429_pattern_summary_flags_mixed_pattern():
     """Companion test: when Retry-After values are NOT all near-zero,
     the summary should say so rather than falsely claim a clean pattern."""
@@ -1100,6 +1165,7 @@ if __name__ == "__main__":
     test_429_backoff_falls_back_when_retry_after_absent()
     test_fetch_ranked_pools_actually_sleeps_the_returned_backoff()
     test_429_pattern_summary_flags_consistent_near_zero_pattern()
+    test_429_observation_records_the_correct_gecko_call_count()
     test_429_pattern_summary_flags_mixed_pattern()
     test_429_pattern_summary_handles_zero_429s_without_crashing()
     test_429_tracking_genuinely_resets_between_separate_run_once_calls()

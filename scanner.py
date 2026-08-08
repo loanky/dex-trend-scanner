@@ -441,6 +441,15 @@ def log_429_and_get_backoff(resp: requests.Response, context: str, default_backo
         "had_ratelimit_header": any("ratelimit" in k.lower() for k in headers_dict),
         "backoff_used": backoff,
         "timestamp": time.monotonic(),
+        # Which call number (within gecko_limiter's own count) this 429
+        # happened on -- added after three separate real GitHub Actions
+        # runs, on different days, ALL hit their first 429 on exactly
+        # call #8. gecko_limiter.wait() always fires immediately before
+        # the request in every caller, so _call_count is already
+        # incremented to reflect THIS call by the time a 429 is detected --
+        # no off-by-one adjustment needed. Set to None if the limiter
+        # object isn't reachable for some reason, rather than crash.
+        "gecko_call_count": getattr(gecko_limiter, "_call_count", None),
     })
 
     return backoff
@@ -481,9 +490,32 @@ def log_429_pattern_summary() -> None:
         obs["retry_after_parsed"] for obs in _429_observations
         if obs["retry_after_parsed"] is not None
     ]
+    call_count_values = [
+        obs["gecko_call_count"] for obs in _429_observations
+        if obs["gecko_call_count"] is not None
+    ]
     any_ratelimit_header = any(obs["had_ratelimit_header"] for obs in _429_observations)
 
     log.warning("429 PATTERN SUMMARY for this run: %d total 429(s) observed", count)
+
+    if call_count_values:
+        # Added after three separate real runs, on different days, ALL
+        # hit their first 429 on exactly call #8 -- landing on the same
+        # call number repeatedly across independent runs is a real signal
+        # of SOME consistent, structural constraint (not necessarily
+        # GeckoTerminal's documented limit being wrong -- could also mean
+        # something about this account/repo's traffic pattern consistently
+        # has similar headroom already used by run start) -- it makes
+        # "random, unrelated bursty third-party traffic" a less likely fit
+        # than pure coincidence would suggest, without confirming any one
+        # specific cause on its own.
+        log.warning(
+            "429 PATTERN SUMMARY: gecko_limiter call number at each 429 (in order): "
+            "%s -- compare this across separate runs over time; a consistently "
+            "repeated call number here is itself a real signal worth tracking, "
+            "even though it alone doesn't confirm a single specific cause.",
+            call_count_values,
+        )
 
     if retry_after_values:
         all_near_zero = all(v <= 1 for v in retry_after_values)
